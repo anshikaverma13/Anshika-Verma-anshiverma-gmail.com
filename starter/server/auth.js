@@ -71,12 +71,74 @@ export function issueAccessToken({ userId, orgId, role, permVersion }, secret) {
 // `node scripts/check-jwt.js` is the public test suite for this function.
 // ---------------------------------------------------------------------------
 export function verifyAccessToken(token, secret) {
-  // YOURS TO WRITE. Every failure mode listed above must be a 401 UNAUTHENTICATED.
-  // `node scripts/check-jwt.js` is the public suite for this function.
-  throw Object.assign(
-    new Error('TODO: server/auth.js — verifyAccessToken() is yours to write (AUTH-DATA-MODEL.md §10).'),
-    { code: 'NOT_IMPLEMENTED' }
-  );
+  // 1. Must be exactly three dot-separated segments.
+  //    Fewer means it is not a JWT at all; more means something was appended.
+  const parts = String(token ?? '').split('.');
+  if (parts.length !== 3) throw unauthenticated('malformed token');
+
+  const [h, p, s] = parts;
+
+  // 2. Header must be valid base64url-encoded JSON that decodes to an object.
+  //    Reject strings, arrays, and anything that is not parseable.
+  let header;
+  try {
+    header = JSON.parse(unb64(h).toString('utf8'));
+  } catch {
+    throw unauthenticated('malformed token header');
+  }
+  if (typeof header !== 'object' || header === null || Array.isArray(header)) {
+    throw unauthenticated('malformed token header');
+  }
+
+  // 3. Pin the algorithm and type — read from the header, but only accept our
+  //    own constants. This is the alg:none and algorithm-substitution defence.
+  //    The constants ALG ('HS256'), ISS and AUD are defined at the top of the file.
+  //    NEVER let the header nominate its own algorithm and then honour that claim.
+  if (header.alg !== ALG || header.typ !== 'JWT') {
+    throw unauthenticated('unsupported token algorithm');
+  }
+
+  // 4. Verify the HMAC-SHA256 signature in constant time.
+  //    Re-compute the expected MAC over exactly "header.payload" using our secret.
+  //    timingSafeEqual guards against timing oracles; the length check guards against
+  //    a truncated or empty signature passing because timingSafeEqual throws on mismatched
+  //    lengths rather than returning false.
+  const expected = createHmac('sha256', secret).update(`${h}.${p}`).digest();
+  const actual = unb64(s);
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+    throw unauthenticated('bad signature');
+  }
+
+  // 5. Payload must be valid base64url-encoded JSON.
+  //    Parsed AFTER the signature check so a forged payload never influences
+  //    any logic before we know the MAC is valid.
+  let claims;
+  try {
+    claims = JSON.parse(unb64(p).toString('utf8'));
+  } catch {
+    throw unauthenticated('malformed token payload');
+  }
+
+  // 6. exp must be a number and strictly greater than now (half-open: exp == now is expired).
+  const now = Math.floor(Date.now() / 1000);
+  if (typeof claims.exp !== 'number' || claims.exp <= now) {
+    throw unauthenticated('token expired');
+  }
+
+  // 7. iss and aud must be our own constants.
+  //    Wrong issuer could mean a token from a different service; wrong audience means
+  //    a token not intended for this API.
+  if (claims.iss !== ISS || claims.aud !== AUD) {
+    throw unauthenticated('bad token issuer or audience');
+  }
+
+  // 8. jti must be present and non-empty.
+  //    It identifies this specific token issuance and is required for revocation support.
+  if (!claims.jti) {
+    throw unauthenticated('token has no jti');
+  }
+
+  return claims;
 }
 
 
